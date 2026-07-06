@@ -12,6 +12,7 @@ const app = express()
 const port = Number(process.env.PORT || 3000)
 const appName = process.env.APP_NAME
 const apiKey = process.env.API_KEY
+const release = 'auto-redeploy-check-001'
 
 let nextNoteId = 2
 const notes = [
@@ -38,6 +39,7 @@ const requireApiKey = (req, res, next) => {
 app.get('/', (_req, res) => {
   res.json({
     app: appName,
+    release,
     message: 'Testing API is running',
     env: {
       apiKeyConfigured: Boolean(apiKey),
@@ -59,6 +61,7 @@ app.get('/health', (_req, res) => {
   res.json({
     app: appName,
     ok: true,
+    release,
     uptime: process.uptime(),
   })
 })
@@ -150,5 +153,5 @@ app.delete('/notes/:id', (req, res) => {
 })
 
 app.listen(port, '0.0.0.0', () => {
-  console.log(`${appName} listening on port ${port}`)
+  console.log(`${appName} ${release} listening on port ${port}`)
 })
