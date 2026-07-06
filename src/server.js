@@ -12,7 +12,7 @@ const app = express();
 const port = Number(process.env.PORT || 3000);
 const appName = process.env.APP_NAME;
 const apiKey = process.env.API_KEY;
-const release = "auto-redeploy-check-003";
+const release = "auto-redeploy-check-002";
 
 let nextNoteId = 2;
 const notes = [
