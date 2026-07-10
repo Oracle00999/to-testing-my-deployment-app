@@ -1,6 +1,7 @@
 const express = require("express");
+const { Pool } = require("pg");
 
-const requiredEnv = ["APP_NAME", "API_KEY"];
+const requiredEnv = ["APP_NAME", "API_KEY", "DATABASE_URL"];
 const missingEnv = requiredEnv.filter((key) => !process.env[key]);
 
 if (missingEnv.length > 0) {
@@ -12,7 +13,11 @@ const app = express();
 const port = Number(process.env.PORT || 3000);
 const appName = process.env.APP_NAME;
 const apiKey = process.env.API_KEY;
-const release = "auto-redeploy-check-004";
+const databaseUrl = process.env.DATABASE_URL;
+const release = "postgres-service-check-001";
+const pool = new Pool({
+  connectionString: databaseUrl,
+});
 
 let nextNoteId = 2;
 const notes = [
@@ -25,6 +30,17 @@ const notes = [
 ];
 
 app.use(express.json());
+
+const initializeDatabase = async () => {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      email TEXT NOT NULL UNIQUE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+};
 
 const requireApiKey = (req, res, next) => {
   if (req.header("x-api-key") !== apiKey) {
@@ -43,6 +59,7 @@ app.get("/", (_req, res) => {
     message: "Testing API is running after a GitHub push",
     env: {
       apiKeyConfigured: Boolean(apiKey),
+      databaseConfigured: Boolean(databaseUrl),
       nodeEnv: process.env.NODE_ENV || "development",
       port,
     },
@@ -53,20 +70,37 @@ app.get("/", (_req, res) => {
       "GET /notes/:id",
       "PATCH /notes/:id",
       "DELETE /notes/:id",
+      "GET /users",
+      "POST /users",
+      "GET /users/:id",
     ],
   });
 });
 
-app.get("/health", (_req, res) => {
-  res.json({
-    app: appName,
-    ok: true,
-    release,
-    uptime: process.uptime(),
-  });
+app.get("/health", async (_req, res) => {
+  try {
+    await pool.query("SELECT 1");
+
+    res.json({
+      app: appName,
+      database: "connected",
+      ok: true,
+      release,
+      uptime: process.uptime(),
+    });
+  } catch (error) {
+    res.status(503).json({
+      app: appName,
+      database: "unreachable",
+      error: error.message,
+      ok: false,
+      release,
+    });
+  }
 });
 
 app.use("/notes", requireApiKey);
+app.use("/users", requireApiKey);
 
 app.get("/notes", (_req, res) => {
   res.json({
@@ -154,6 +188,75 @@ app.delete("/notes/:id", (req, res) => {
   return res.status(204).send();
 });
 
-app.listen(port, "0.0.0.0", () => {
-  console.log(`${appName} ${release} listening on port ${port}`);
+app.get("/users", async (_req, res) => {
+  const result = await pool.query(
+    "SELECT id, name, email, created_at AS \"createdAt\" FROM users ORDER BY id DESC",
+  );
+
+  res.json({
+    count: result.rowCount,
+    data: result.rows,
+  });
 });
+
+app.post("/users", async (req, res) => {
+  const name = String(req.body.name || "").trim();
+  const email = String(req.body.email || "").trim().toLowerCase();
+
+  if (!name || !email) {
+    return res.status(400).json({
+      error: "name and email are required",
+    });
+  }
+
+  try {
+    const result = await pool.query(
+      `
+        INSERT INTO users (name, email)
+        VALUES ($1, $2)
+        RETURNING id, name, email, created_at AS "createdAt"
+      `,
+      [name, email],
+    );
+
+    return res.status(201).json({
+      data: result.rows[0],
+    });
+  } catch (error) {
+    if (error.code === "23505") {
+      return res.status(409).json({
+        error: "A user with this email already exists",
+      });
+    }
+
+    throw error;
+  }
+});
+
+app.get("/users/:id", async (req, res) => {
+  const result = await pool.query(
+    "SELECT id, name, email, created_at AS \"createdAt\" FROM users WHERE id = $1",
+    [Number(req.params.id)],
+  );
+
+  if (result.rowCount === 0) {
+    return res.status(404).json({
+      error: "User not found",
+    });
+  }
+
+  return res.json({
+    data: result.rows[0],
+  });
+});
+
+initializeDatabase()
+  .then(() => {
+    app.listen(port, "0.0.0.0", () => {
+      console.log(`${appName} ${release} listening on port ${port}`);
+    });
+  })
+  .catch((error) => {
+    console.error("Database initialization failed:", error.message);
+    process.exit(1);
+  });
