@@ -1,7 +1,8 @@
 const express = require("express");
 const { Pool } = require("pg");
+const { createClient } = require("redis");
 
-const requiredEnv = ["APP_NAME", "API_KEY", "DATABASE_URL"];
+const requiredEnv = ["APP_NAME", "API_KEY", "DATABASE_URL", "REDIS_URL"];
 const missingEnv = requiredEnv.filter((key) => !process.env[key]);
 
 if (missingEnv.length > 0) {
@@ -14,9 +15,21 @@ const port = Number(process.env.PORT || 3000);
 const appName = process.env.APP_NAME;
 const apiKey = process.env.API_KEY;
 const databaseUrl = process.env.DATABASE_URL;
-const release = "postgres-service-check-001";
+const redisUrl = process.env.REDIS_URL;
+const release = "redis-service-check-001";
 const pool = new Pool({
   connectionString: databaseUrl,
+});
+const redis = createClient({
+  socket: {
+    connectTimeout: 5000,
+    reconnectStrategy: false,
+  },
+  url: redisUrl,
+});
+
+redis.on("error", (error) => {
+  console.error("Redis connection error:", error.message);
 });
 
 let nextNoteId = 2;
@@ -60,6 +73,7 @@ app.get("/", (_req, res) => {
     env: {
       apiKeyConfigured: Boolean(apiKey),
       databaseConfigured: Boolean(databaseUrl),
+      redisConfigured: Boolean(redisUrl),
       nodeEnv: process.env.NODE_ENV || "development",
       port,
     },
@@ -73,17 +87,21 @@ app.get("/", (_req, res) => {
       "GET /users",
       "POST /users",
       "GET /users/:id",
+      "GET /cache/:key",
+      "PUT /cache/:key",
+      "DELETE /cache/:key",
     ],
   });
 });
 
 app.get("/health", async (_req, res) => {
   try {
-    await pool.query("SELECT 1");
+    await Promise.all([pool.query("SELECT 1"), redis.ping()]);
 
     res.json({
       app: appName,
       database: "connected",
+      redis: "connected",
       ok: true,
       release,
       uptime: process.uptime(),
@@ -91,7 +109,7 @@ app.get("/health", async (_req, res) => {
   } catch (error) {
     res.status(503).json({
       app: appName,
-      database: "unreachable",
+      services: "unreachable",
       error: error.message,
       ok: false,
       release,
@@ -101,6 +119,7 @@ app.get("/health", async (_req, res) => {
 
 app.use("/notes", requireApiKey);
 app.use("/users", requireApiKey);
+app.use("/cache", requireApiKey);
 
 app.get("/notes", (_req, res) => {
   res.json({
@@ -250,13 +269,73 @@ app.get("/users/:id", async (req, res) => {
   });
 });
 
-initializeDatabase()
+app.get("/cache/:key", async (req, res) => {
+  const value = await redis.get(req.params.key);
+
+  if (value === null) {
+    return res.status(404).json({
+      error: "Cache key not found",
+    });
+  }
+
+  return res.json({
+    data: {
+      key: req.params.key,
+      value,
+    },
+  });
+});
+
+app.put("/cache/:key", async (req, res) => {
+  const value = String(req.body.value ?? "");
+  const expiresIn = Number(req.body.expiresIn || 0);
+
+  if (!value) {
+    return res.status(400).json({
+      error: "value is required",
+    });
+  }
+
+  if (!Number.isInteger(expiresIn) || expiresIn < 0) {
+    return res.status(400).json({
+      error: "expiresIn must be a positive whole number",
+    });
+  }
+
+  if (expiresIn > 0) {
+    await redis.set(req.params.key, value, { EX: expiresIn });
+  } else {
+    await redis.set(req.params.key, value);
+  }
+
+  return res.status(201).json({
+    data: {
+      expiresIn: expiresIn > 0 ? expiresIn : null,
+      key: req.params.key,
+      value,
+    },
+  });
+});
+
+app.delete("/cache/:key", async (req, res) => {
+  const deleted = await redis.del(req.params.key);
+
+  if (deleted === 0) {
+    return res.status(404).json({
+      error: "Cache key not found",
+    });
+  }
+
+  return res.status(204).send();
+});
+
+Promise.all([initializeDatabase(), redis.connect()])
   .then(() => {
     app.listen(port, "0.0.0.0", () => {
       console.log(`${appName} ${release} listening on port ${port}`);
     });
   })
   .catch((error) => {
-    console.error("Database initialization failed:", error.message);
+    console.error("Service initialization failed:", error.message);
     process.exit(1);
   });
