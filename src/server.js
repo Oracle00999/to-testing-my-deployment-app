@@ -1,8 +1,15 @@
 const express = require("express");
+const mysql = require("mysql2/promise");
 const { Pool } = require("pg");
 const { createClient } = require("redis");
 
-const requiredEnv = ["APP_NAME", "API_KEY", "DATABASE_URL", "REDIS_URL"];
+const requiredEnv = [
+  "APP_NAME",
+  "API_KEY",
+  "DATABASE_URL",
+  "REDIS_URL",
+  "MYSQL_URL",
+];
 const missingEnv = requiredEnv.filter((key) => !process.env[key]);
 
 if (missingEnv.length > 0) {
@@ -16,10 +23,12 @@ const appName = process.env.APP_NAME;
 const apiKey = process.env.API_KEY;
 const databaseUrl = process.env.DATABASE_URL;
 const redisUrl = process.env.REDIS_URL;
-const release = "redis-service-check-001";
+const mysqlUrl = process.env.MYSQL_URL;
+const release = "mysql-service-check-001";
 const pool = new Pool({
   connectionString: databaseUrl,
 });
+const mysqlPool = mysql.createPool(mysqlUrl);
 const redis = createClient({
   socket: {
     connectTimeout: 5000,
@@ -55,6 +64,17 @@ const initializeDatabase = async () => {
   `);
 };
 
+const initializeMySql = async () => {
+  await mysqlPool.query(`
+    CREATE TABLE IF NOT EXISTS products (
+      id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+      name VARCHAR(255) NOT NULL,
+      price DECIMAL(10, 2) NOT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+};
+
 const requireApiKey = (req, res, next) => {
   if (req.header("x-api-key") !== apiKey) {
     return res.status(401).json({
@@ -73,6 +93,7 @@ app.get("/", (_req, res) => {
     env: {
       apiKeyConfigured: Boolean(apiKey),
       databaseConfigured: Boolean(databaseUrl),
+      mysqlConfigured: Boolean(mysqlUrl),
       redisConfigured: Boolean(redisUrl),
       nodeEnv: process.env.NODE_ENV || "development",
       port,
@@ -87,6 +108,9 @@ app.get("/", (_req, res) => {
       "GET /users",
       "POST /users",
       "GET /users/:id",
+      "GET /products",
+      "POST /products",
+      "GET /products/:id",
       "GET /cache/:key",
       "PUT /cache/:key",
       "DELETE /cache/:key",
@@ -96,11 +120,16 @@ app.get("/", (_req, res) => {
 
 app.get("/health", async (_req, res) => {
   try {
-    await Promise.all([pool.query("SELECT 1"), redis.ping()]);
+    await Promise.all([
+      pool.query("SELECT 1"),
+      mysqlPool.query("SELECT 1"),
+      redis.ping(),
+    ]);
 
     res.json({
       app: appName,
       database: "connected",
+      mysql: "connected",
       redis: "connected",
       ok: true,
       release,
@@ -119,6 +148,7 @@ app.get("/health", async (_req, res) => {
 
 app.use("/notes", requireApiKey);
 app.use("/users", requireApiKey);
+app.use("/products", requireApiKey);
 app.use("/cache", requireApiKey);
 
 app.get("/notes", (_req, res) => {
@@ -269,6 +299,68 @@ app.get("/users/:id", async (req, res) => {
   });
 });
 
+app.get("/products", async (_req, res) => {
+  const [products] = await mysqlPool.query(`
+    SELECT id, name, price, created_at AS createdAt
+    FROM products
+    ORDER BY id DESC
+  `);
+
+  res.json({
+    count: products.length,
+    data: products,
+  });
+});
+
+app.post("/products", async (req, res) => {
+  const name = String(req.body.name || "").trim();
+  const price = Number(req.body.price);
+
+  if (!name || !Number.isFinite(price) || price < 0) {
+    return res.status(400).json({
+      error: "name and a valid non-negative price are required",
+    });
+  }
+
+  const [result] = await mysqlPool.execute(
+    "INSERT INTO products (name, price) VALUES (?, ?)",
+    [name, price],
+  );
+  const [products] = await mysqlPool.execute(
+    `
+      SELECT id, name, price, created_at AS createdAt
+      FROM products
+      WHERE id = ?
+    `,
+    [result.insertId],
+  );
+
+  return res.status(201).json({
+    data: products[0],
+  });
+});
+
+app.get("/products/:id", async (req, res) => {
+  const [products] = await mysqlPool.execute(
+    `
+      SELECT id, name, price, created_at AS createdAt
+      FROM products
+      WHERE id = ?
+    `,
+    [Number(req.params.id)],
+  );
+
+  if (products.length === 0) {
+    return res.status(404).json({
+      error: "Product not found",
+    });
+  }
+
+  return res.json({
+    data: products[0],
+  });
+});
+
 app.get("/cache/:key", async (req, res) => {
   const value = await redis.get(req.params.key);
 
@@ -329,7 +421,7 @@ app.delete("/cache/:key", async (req, res) => {
   return res.status(204).send();
 });
 
-Promise.all([initializeDatabase(), redis.connect()])
+Promise.all([initializeDatabase(), initializeMySql(), redis.connect()])
   .then(() => {
     app.listen(port, "0.0.0.0", () => {
       console.log(`${appName} ${release} listening on port ${port}`);
