@@ -1,4 +1,5 @@
 const express = require("express");
+const { MongoClient, ObjectId } = require("mongodb");
 const mysql = require("mysql2/promise");
 const { Pool } = require("pg");
 const { createClient } = require("redis");
@@ -9,6 +10,7 @@ const requiredEnv = [
   "DATABASE_URL",
   "REDIS_URL",
   "MYSQL_URL",
+  "MONGODB_URI",
 ];
 const missingEnv = requiredEnv.filter((key) => !process.env[key]);
 
@@ -24,11 +26,16 @@ const apiKey = process.env.API_KEY;
 const databaseUrl = process.env.DATABASE_URL;
 const redisUrl = process.env.REDIS_URL;
 const mysqlUrl = process.env.MYSQL_URL;
-const release = "mysql-service-check-001";
+const mongodbUri = process.env.MONGODB_URI;
+const release = "mongodb-service-check-001";
 const pool = new Pool({
   connectionString: databaseUrl,
 });
 const mysqlPool = mysql.createPool(mysqlUrl);
+const mongoClient = new MongoClient(mongodbUri, {
+  serverSelectionTimeoutMS: 5000,
+});
+const mongoDatabase = mongoClient.db();
 const redis = createClient({
   socket: {
     connectTimeout: 5000,
@@ -75,6 +82,18 @@ const initializeMySql = async () => {
   `);
 };
 
+const initializeMongoDb = async () => {
+  await mongoClient.connect();
+  await mongoDatabase.collection("events").createIndex({ createdAt: -1 });
+};
+
+const toEventResource = (event) => ({
+  id: event._id.toString(),
+  name: event.name,
+  payload: event.payload,
+  createdAt: event.createdAt,
+});
+
 const requireApiKey = (req, res, next) => {
   if (req.header("x-api-key") !== apiKey) {
     return res.status(401).json({
@@ -93,6 +112,7 @@ app.get("/", (_req, res) => {
     env: {
       apiKeyConfigured: Boolean(apiKey),
       databaseConfigured: Boolean(databaseUrl),
+      mongodbConfigured: Boolean(mongodbUri),
       mysqlConfigured: Boolean(mysqlUrl),
       redisConfigured: Boolean(redisUrl),
       nodeEnv: process.env.NODE_ENV || "development",
@@ -111,6 +131,9 @@ app.get("/", (_req, res) => {
       "GET /products",
       "POST /products",
       "GET /products/:id",
+      "GET /events",
+      "POST /events",
+      "GET /events/:id",
       "GET /cache/:key",
       "PUT /cache/:key",
       "DELETE /cache/:key",
@@ -123,12 +146,14 @@ app.get("/health", async (_req, res) => {
     await Promise.all([
       pool.query("SELECT 1"),
       mysqlPool.query("SELECT 1"),
+      mongoDatabase.command({ ping: 1 }),
       redis.ping(),
     ]);
 
     res.json({
       app: appName,
       database: "connected",
+      mongodb: "connected",
       mysql: "connected",
       redis: "connected",
       ok: true,
@@ -149,6 +174,7 @@ app.get("/health", async (_req, res) => {
 app.use("/notes", requireApiKey);
 app.use("/users", requireApiKey);
 app.use("/products", requireApiKey);
+app.use("/events", requireApiKey);
 app.use("/cache", requireApiKey);
 
 app.get("/notes", (_req, res) => {
@@ -361,6 +387,67 @@ app.get("/products/:id", async (req, res) => {
   });
 });
 
+app.get("/events", async (_req, res) => {
+  const events = await mongoDatabase
+    .collection("events")
+    .find({})
+    .sort({ createdAt: -1 })
+    .limit(100)
+    .toArray();
+
+  return res.json({
+    count: events.length,
+    data: events.map(toEventResource),
+  });
+});
+
+app.post("/events", async (req, res) => {
+  const name = String(req.body.name || "").trim();
+  const payload = req.body.payload ?? null;
+
+  if (!name) {
+    return res.status(400).json({
+      error: "name is required",
+    });
+  }
+
+  const event = {
+    name,
+    payload,
+    createdAt: new Date(),
+  };
+  const result = await mongoDatabase.collection("events").insertOne(event);
+
+  return res.status(201).json({
+    data: toEventResource({
+      _id: result.insertedId,
+      ...event,
+    }),
+  });
+});
+
+app.get("/events/:id", async (req, res) => {
+  if (!ObjectId.isValid(req.params.id)) {
+    return res.status(404).json({
+      error: "Event not found",
+    });
+  }
+
+  const event = await mongoDatabase.collection("events").findOne({
+    _id: new ObjectId(req.params.id),
+  });
+
+  if (!event) {
+    return res.status(404).json({
+      error: "Event not found",
+    });
+  }
+
+  return res.json({
+    data: toEventResource(event),
+  });
+});
+
 app.get("/cache/:key", async (req, res) => {
   const value = await redis.get(req.params.key);
 
@@ -421,7 +508,12 @@ app.delete("/cache/:key", async (req, res) => {
   return res.status(204).send();
 });
 
-Promise.all([initializeDatabase(), initializeMySql(), redis.connect()])
+Promise.all([
+  initializeDatabase(),
+  initializeMySql(),
+  initializeMongoDb(),
+  redis.connect(),
+])
   .then(() => {
     app.listen(port, "0.0.0.0", () => {
       console.log(`${appName} ${release} listening on port ${port}`);
